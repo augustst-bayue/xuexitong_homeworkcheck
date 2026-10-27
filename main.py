@@ -6,6 +6,9 @@
 
 运行结束后，结果会保存到桌面的 unfinished_homework.txt 并自动打开。
 
+账号与密码以登录表单所需的 AES 密文形式保存在 ~/.xuexitong_homeworkcheck/config.json，
+后续运行直接复用密文，无需重复输入、重复加密。
+
 依赖：
     pip install requests pycryptodome
 
@@ -24,7 +27,7 @@ from pathlib import Path
 import msvcrt
 import requests
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
+from Crypto.Util.Padding import pad, unpad
 
 # ============ 配置区 ============
 CONFIG_NAME = "xuexitong_homeworkcheck"
@@ -36,17 +39,54 @@ TIMEOUT = 20  # 单次请求超时时间（秒）
 RETRY = 4  # 请求失败最大重试次数
 
 
-# ============ 账号读取 ============
+# ============ 账号读写 ============
+def aes_enc(text: str) -> str:
+    """AES-CBC 加密 + Base64 编码，产出登录表单 uname / password 字段的取值。"""
+    cipher = AES.new(KEY, AES.MODE_CBC, KEY)
+    return base64.b64encode(cipher.encrypt(pad(text.encode(), 16))).decode()
+
+
+def aes_dec(blob: str) -> str:
+    """aes_enc 的逆运算，仅用于显示已保存的账号。"""
+    cipher = AES.new(KEY, AES.MODE_CBC, KEY)
+    return unpad(cipher.decrypt(base64.b64decode(blob)), 16).decode()
+
+
+def masked_account(uname_enc: str) -> str:
+    """从密文解出账号并打码显示（138****0000），解不出时返回「已保存的账号」。"""
+    try:
+        uname = aes_dec(uname_enc)
+    except Exception:
+        return "已保存的账号"
+    return f"{uname[:3]}****{uname[-4:]}" if len(uname) >= 8 else uname
+
+
+def save_config(uname_enc: str, password_enc: str) -> None:
+    """把登录表单所需的密文写入配置文件，明文不落盘。"""
+    CONFIG_FILE.write_text(
+        json.dumps(
+            {"uname": uname_enc, "password": password_enc}, ensure_ascii=False, indent=2
+        ),
+        encoding="utf-8",
+    )
+
+
 def load_login() -> tuple[str, str]:
-    """检测/创建配置文件，返回 (phone, password)。"""
+    """检测/创建配置文件，返回登录表单所需的 (uname 密文, password 密文)。"""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
     if CONFIG_FILE.exists():
         try:
             cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            phone, password = cfg.get("phone", ""), cfg.get("password", "")
-            if phone and password:
-                print(f"检测到已保存的学习通账号：{phone}")
+            if cfg.get("phone") and cfg.get("password"):
+                # 旧版本以明文保存，这里自动迁移为密文，之后不再落明文
+                uname_enc, password_enc = aes_enc(cfg["phone"]), aes_enc(cfg["password"])
+                save_config(uname_enc, password_enc)
+            else:
+                uname_enc = cfg.get("uname", "")
+                password_enc = cfg.get("password", "")
+            if uname_enc and password_enc:
+                print(f"检测到已保存的学习通账号：{masked_account(uname_enc)}")
                 print("接下来将登录该账号，抓取各课程中未完成的作业，")
                 print("**如需更换账号，请在 3 秒内按任意键**；否则自动继续……")
 
@@ -65,7 +105,7 @@ def load_login() -> tuple[str, str]:
                 print()
 
                 if not pressed:
-                    return phone, password
+                    return uname_enc, password_enc
 
                 print("请输入新的账号密码，输入完成后进入查询。")
             else:
@@ -79,18 +119,14 @@ def load_login() -> tuple[str, str]:
     phone = input("手机号: ").strip()
     password = input("密码:   ").strip()
 
-    CONFIG_FILE.write_text(
-        json.dumps(
-            {"phone": phone, "password": password}, ensure_ascii=False, indent=2
-        ),
-        encoding="utf-8",
-    )
-    return phone, password
+    uname_enc, password_enc = aes_enc(phone), aes_enc(password)
+    save_config(uname_enc, password_enc)
+    return uname_enc, password_enc
 
 
 # ============ 作业抓取 ============
-def fetch_unfinished_homework_text(phone: str, password: str) -> str:
-    """抓取并返回未完成作业的汇总文本（可直接打印或发送）。"""
+def fetch_unfinished_homework_text(uname_enc: str, password_enc: str) -> str:
+    """用已保存的登录密文抓取并返回未完成作业的汇总文本。"""
 
     s = requests.Session()
     s.headers["User-Agent"] = (
@@ -99,22 +135,17 @@ def fetch_unfinished_homework_text(phone: str, password: str) -> str:
     )
 
     def login() -> None:
-        """使用 AES 加密的手机号/密码登录，登录态保留在 session 中。"""
+        """用已保存的登录密文登录，登录态保留在 session 中。"""
         # 先访问登录页建立会话，拿到必要 Cookie
         s.get("https://passport2.chaoxing.com/login", timeout=TIMEOUT)
-
-        def enc(text: str) -> str:
-            """AES-CBC 加密 + Base64 编码，用于登录表单的 uname / password 字段。"""
-            cipher = AES.new(KEY, AES.MODE_CBC, KEY)
-            return base64.b64encode(cipher.encrypt(pad(text.encode(), 16))).decode()
 
         s.post(
             "https://passport2.chaoxing.com/fanyalogin",
             timeout=TIMEOUT,
             data={
                 "fid": "-1",
-                "uname": enc(phone),
-                "password": enc(password),
+                "uname": uname_enc,
+                "password": password_enc,
                 "refer": "https%3A%2F%2Fi.chaoxing.com",
                 "t": "true",
                 "forbidotherlogin": "0",
@@ -332,8 +363,8 @@ def main() -> None:
     print(" 超星学习通 · 未完成作业查询")
     print("=" * 46)
 
-    phone, password = load_login()
-    text = fetch_unfinished_homework_text(phone, password)
+    uname_enc, password_enc = load_login()
+    text = fetch_unfinished_homework_text(uname_enc, password_enc)
     save_and_open(text)
 
 
