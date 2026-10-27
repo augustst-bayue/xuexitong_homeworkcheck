@@ -4,32 +4,92 @@
 登录学习通后，遍历当前账号下所有课程，抓取作业列表并筛选出未完成的作业，
 按剩余时间由近到远排序输出，便于优先处理临近截止的任务。
 
+运行结束后，结果会保存到桌面的 unfinished_homework.txt 并自动打开。
+
 依赖：
     pip install requests pycryptodome
+
+说明：
+    本脚本仅支持 Windows
 """
 
 import base64
+import json
+import os
 import re
 import time
+import winreg
+from pathlib import Path
 
+import msvcrt
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
-
 # ============ 配置区 ============
-PHONE = "xxx"            # 学习通登录手机号
-PASSWORD = "xxx"         # 学习通登录密码
+CONFIG_NAME = "xuexitong_homeworkcheck"
+CONFIG_DIR = Path.home() / f".{CONFIG_NAME}"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
-KEY = b"u2oh6Vu^HWe4_AES"   # 登录表单 AES-CBC 加密所用的固定密钥
-TIMEOUT = 20                # 单次请求超时时间（秒）
-RETRY = 4                   # 请求失败最大重试次数
-
-# 这些状态视为"已完成"，不再计入未完成列表
-DONE_STATUS = ("已完成", "已提交", "待批阅", "已批阅", "已批改", "已互评")
+KEY = b"u2oh6Vu^HWe4_AES"  # 登录表单 AES-CBC 加密所用的固定密钥
+TIMEOUT = 20  # 单次请求超时时间（秒）
+RETRY = 4  # 请求失败最大重试次数
 
 
-def fetch_unfinished_homework_text() -> str:
+# ============ 账号读取 ============
+def load_login() -> tuple[str, str]:
+    """检测/创建配置文件，返回 (phone, password)。"""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if CONFIG_FILE.exists():
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            phone, password = cfg.get("phone", ""), cfg.get("password", "")
+            if phone and password:
+                print(f"检测到已保存的学习通账号：{phone}")
+                print("接下来将登录该账号，抓取各课程中未完成的作业，")
+                print("**如需更换账号，请在 3 秒内按任意键**；否则自动继续……")
+
+                deadline = time.time() + 3
+                pressed = False
+                while time.time() < deadline:
+                    remain = int(deadline - time.time()) + 1
+                    print(
+                        f"\r  倒计时 {remain} 秒，按任意键修改账号…", end="", flush=True
+                    )
+                    if msvcrt.kbhit():
+                        msvcrt.getch()
+                        pressed = True
+                        break
+                    time.sleep(0.1)
+                print()
+
+                if not pressed:
+                    return phone, password
+
+                print("请输入新的账号密码，输入完成后进入查询。")
+            else:
+                print("配置文件内容不完整，请重新输入账号密码。")
+        except Exception as e:
+            print(f"读取配置失败（{e}），请重新输入账号密码。")
+    else:
+        print("首次运行，需要先登录学习通账号。")
+        print("登录后脚本会查询账号下的未完成作业。")
+        print()
+    phone = input("手机号: ").strip()
+    password = input("密码:   ").strip()
+
+    CONFIG_FILE.write_text(
+        json.dumps(
+            {"phone": phone, "password": password}, ensure_ascii=False, indent=2
+        ),
+        encoding="utf-8",
+    )
+    return phone, password
+
+
+# ============ 作业抓取 ============
+def fetch_unfinished_homework_text(phone: str, password: str) -> str:
     """抓取并返回未完成作业的汇总文本（可直接打印或发送）。"""
 
     s = requests.Session()
@@ -38,7 +98,7 @@ def fetch_unfinished_homework_text() -> str:
         "(KHTML, like Gecko) Chrome/118 Safari/537.36"
     )
 
-    def login():
+    def login() -> None:
         """使用 AES 加密的手机号/密码登录，登录态保留在 session 中。"""
         # 先访问登录页建立会话，拿到必要 Cookie
         s.get("https://passport2.chaoxing.com/login", timeout=TIMEOUT)
@@ -53,8 +113,8 @@ def fetch_unfinished_homework_text() -> str:
             timeout=TIMEOUT,
             data={
                 "fid": "-1",
-                "uname": enc(PHONE),
-                "password": enc(PASSWORD),
+                "uname": enc(phone),
+                "password": enc(password),
                 "refer": "https%3A%2F%2Fi.chaoxing.com",
                 "t": "true",
                 "forbidotherlogin": "0",
@@ -65,7 +125,7 @@ def fetch_unfinished_homework_text() -> str:
         )
 
     def get(url: str, **kw) -> requests.Response:
-        """带重试的 GET：网络异常时退避重试；若被踢回登录页则重新登录后重放，学习通第一次登陆时常拒绝。"""
+        """带重试的 GET：网络异常时退避重试；若被踢回登录页则重新登录后重放。"""
         kw.setdefault("timeout", TIMEOUT)
         last_exc = None
 
@@ -73,11 +133,11 @@ def fetch_unfinished_homework_text() -> str:
             try:
                 r = s.get(url, **kw)
                 break
-            except Exception as e:          # 网络抖动，等待后重试
+            except Exception as e:  # 网络抖动，等待后重试
                 last_exc = e
                 time.sleep(1.2 * (i + 1))
         else:
-            raise last_exc                  # 重试耗尽，抛出最后一次异常
+            raise last_exc  # 重试耗尽，抛出最后一次异常
 
         # 登录态失效：重新登录并重放一次请求
         if "passport2.chaoxing.com/login" in r.url or "用户登录" in r.text:
@@ -103,13 +163,7 @@ def fetch_unfinished_homework_text() -> str:
             # aria-label 形如 "作业标题;状态"，用分号切分
             title, _, status = label.partition(";")
             rm = re.search(r"(剩余\d+小时\d+分钟)", body)
-            out.append(
-                (
-                    title.strip(),
-                    status.strip(),
-                    rm.group(1) if rm else None,
-                )
-            )
+            out.append((title.strip(), status.strip(), rm.group(1) if rm else None))
         return out
 
     def to_minutes(remaining: str | None) -> int | None:
@@ -140,10 +194,12 @@ def fetch_unfinished_homework_text() -> str:
     login()
 
     # 从个人主页提取当前账号的机构 fid，失败时回落到默认值
-    fid = (
-        re.search(r'"fid"\s*:\s*"?(\d+)"?', get("https://i.chaoxing.com/base").text)
-        or [None, "427"]
-    )[1]
+    try:
+        base_html = get("https://i.chaoxing.com/base").text
+        m = re.search(r'"fid"\s*:\s*"?(\d+)"?', base_html)
+        fid = m.group(1) if m else "427"
+    except Exception:
+        fid = "427"
 
     # 拉取课程列表页 HTML
     course_list_html = get(
@@ -156,8 +212,8 @@ def fetch_unfinished_homework_text() -> str:
         },
     ).text
 
-    results: list[list[str | None]] = []    # [(课程名, 剩余时间原文, 作业标题), ...]
-    seen: set[tuple[str, str, str]] = set() # 去重，避免同一课程被重复抓取
+    results: list[list[str | None]] = []  # [(课程名, 剩余时间原文, 作业标题), ...]
+    seen: set[tuple[str, str, str]] = set()  # 去重，避免同一课程被重复抓取
 
     for m in re.finditer(
         r"stucoursemiddle\?courseid=(\d+)&clazzid=(\d+)&cpi=(\d+)", course_list_html
@@ -168,13 +224,11 @@ def fetch_unfinished_homework_text() -> str:
         seen.add((cid, clz, cpi))
 
         # 课程名在链接附近的 course-name 属性里
-        name = (
-            re.search(
-                r'course-name[^>]*title="([^"]+)"',
-                course_list_html[m.end(): m.end() + 1600],
-            )
-            or [None, "?"]
-        )[1]
+        name_m = re.search(
+            r'course-name[^>]*title="([^"]+)"',
+            course_list_html[m.end() : m.end() + 1600],
+        )
+        name = name_m.group(1) if name_m else "?"
 
         # 进入课程主页，取出访问作业列表所需的隐藏参数
         page = get(
@@ -189,7 +243,7 @@ def fetch_unfinished_homework_text() -> str:
         ).text
 
         if not (work_enc := hidden(page, "workEnc")):
-            continue    # 该课程没有作业模块，跳过
+            continue  # 该课程没有作业模块，跳过
 
         hw_html = get(
             "https://mooc1.chaoxing.com/mooc2/work/list",
@@ -207,9 +261,10 @@ def fetch_unfinished_homework_text() -> str:
         ).text
 
         for title, status, remaining in parse_hw_list(hw_html):
-            if any(k in status for k in DONE_STATUS):
-                continue
-            results.append([name, remaining, title])
+            if status == "未交":
+                results.append([name, remaining, title])
+            elif status == "待互评":
+                results.append([name, remaining, title + "（待互评）"])
 
     if not results:
         return "暂无未完成作业。"
@@ -247,5 +302,40 @@ def fetch_unfinished_homework_text() -> str:
 
     return "\n".join(lines).rstrip().replace("&nbsp;", "")
 
-# 打印结果
-print(fetch_unfinished_homework_text())
+
+# ============ 结果输出 ============
+def get_desktop_path() -> Path:
+    """通过注册表获取当前用户真实的桌面路径，兼容 OneDrive 重定向与中文系统。"""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        )
+        value, _ = winreg.QueryValueEx(key, "Desktop")
+        winreg.CloseKey(key)
+        return Path(os.path.expandvars(value))  # 展开 %USERPROFILE% 等环境变量
+    except OSError:
+        return Path.home() / "Desktop"
+
+
+def save_and_open(text: str) -> None:
+    """把结果写入桌面文件并自动打开。"""
+    path = get_desktop_path() / "unfinished_homework.txt"
+    path.write_text(text, encoding="utf-8")
+    print("查询完成")
+    os.startfile(path)
+
+
+# ============ 入口 ============
+def main() -> None:
+    print("=" * 46)
+    print(" 超星学习通 · 未完成作业查询")
+    print("=" * 46)
+
+    phone, password = load_login()
+    text = fetch_unfinished_homework_text(phone, password)
+    save_and_open(text)
+
+
+if __name__ == "__main__":
+    main()

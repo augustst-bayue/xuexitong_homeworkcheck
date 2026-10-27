@@ -2,3 +2,10 @@ __pycache__/
 *.py[cod]
 .vscode/
 .idea/
+
+# 账号配置（实际位于用户目录 ~/.xuexitong_homeworkcheck/，此处为防误提交）
+config.json
+.xuexitong_homeworkcheck/
+
+# 运行产物
+unfinished_homework.txt
